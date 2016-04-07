@@ -1,5 +1,5 @@
 {
-	"name": "curtk/cakephp-queue",
+	"name": "symphosize/cakephp-queue",
 	"type": "cakephp-plugin",
 	"description": "The Queue plugin for CakePHP provides deferred task execution.",
 	"keywords": ["cakephp","queue","deferred tasks","background"],
