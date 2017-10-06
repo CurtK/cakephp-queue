@@ -131,7 +131,8 @@ class QueuedTask extends QueueAppModel {
 			'order' => [
 				'priority ASC',
 				'age ASC',
-				'id ASC'
+				'id ASC',
+                'RAND()', //TODO when there are lots of items in the queue this will help the queue workers grab unique tasks instead of conflict
 			],
 			'limit' => 3
 		];

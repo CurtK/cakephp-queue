@@ -200,6 +200,8 @@ class QueueShell extends AppShell {
 				touch($pidFilePath . $pidFileName);
 			}
 			$this->_log('runworker', isset($pid) ? $pid : null);
+            //TODO check if this workers is still on the right version or if we need to stop because a new deployment is running
+
 			$this->out('[' . date('Y-m-d H:i:s') . '] Looking for Job ...');
 
 			$data = $this->QueuedTask->requestJob($this->_getTaskConf(), $group);
