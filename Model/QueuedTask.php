@@ -1,4 +1,6 @@
 <?php
+use Aws\Sqs\SqsClient;
+
 App::uses('QueueAppModel', 'Queue.Model');
 App::uses('Hash', 'Utility');
 
@@ -10,6 +12,8 @@ App::uses('Hash', 'Utility');
  * @link http://github.com/MSeven/cakephp_queue
  */
 class QueuedTask extends QueueAppModel {
+
+    public $sqsClient;
 
 	public $_next_priority = 5;
 
@@ -36,6 +40,19 @@ class QueuedTask extends QueueAppModel {
 
 		// set virtualFields
 		$this->virtualFields['status'] = '(CASE WHEN ' . $this->alias . '.notbefore > NOW() THEN \'NOT_READY\' WHEN ' . $this->alias . '.fetched IS null THEN \'NOT_STARTED\' WHEN ' . $this->alias . '.fetched IS NOT null AND ' . $this->alias . '.completed IS null AND ' . $this->alias . '.failed = 0 THEN \'IN_PROGRESS\' WHEN ' . $this->alias . '.fetched IS NOT null AND ' . $this->alias . '.completed IS null AND ' . $this->alias . '.failed > 0 THEN \'FAILED\' WHEN ' . $this->alias . '.fetched IS NOT null AND ' . $this->alias . '.completed IS NOT null THEN \'COMPLETED\' ELSE \'UNKNOWN\' END)';
+
+        $Settings = ClassRegistry::init('Symphosize.Setting');
+        $settings = $Settings->getValues([
+            'aws_key',
+            'aws_secret_key'
+        ]);
+
+        //set up the flySystem
+        $this->sqsClient = SqsClient::factory([
+            'key'    => $settings['aws_key'],
+            'secret' => $settings['aws_secret_key'],
+            'region' => 'us-east-1'
+        ]);
 	}
 
 /**
@@ -80,6 +97,56 @@ class QueuedTask extends QueueAppModel {
  * @return array            Created Job array containing id, data, ...
  */
 	public function createJob($jobName, $data = null, $notBefore = null, $group = null, $reference = null) {
+        //to try and prevent duplicate jobs for already scheduled jobs we will try a "by dupekey" lookup for certain job types
+        $dupeKey = false;
+        switch($jobName) {
+            case 'CrewCalNotifyCalendarUpdate':
+                $dupeKey = $data['calendar_id'];
+                break;
+            case 'GoogleCalendarChannelKeepAlive':
+                $dupeKey = $data['id'];
+                break;
+            case 'ReinitFollowUpInstance':
+                $dupeKey = $data['instance_id'];
+                break;
+            case 'ReleaseModule':
+                $dupeKey = $data['company_id'] . '.' . $data['sub_service_id'];
+                break;
+            case 'SaveConnection':
+                $dupeKey = $data['bidId'];
+                break;
+            case 'SaveSingleConnection':
+                $dupeKey = $data['provider'] . '.' . $data['bidId'];
+                break;
+            case 'SyncIntercomCompany':
+                $dupeKey = $data['company_id'];
+                break;
+            case 'UpdateModuleService':
+                $dupeKey = $data['sub_service_id'];
+                break;
+        }
+
+        //check for duplicate
+        if($dupeKey) {
+            $dupe = false;
+            try {
+                $dupe = $this->find('first', [
+                    'conditions' => [
+                        'jobtype' => $jobName,
+                        'dupekey' => $dupeKey,
+                        'fetched IS NULL'
+
+                    ],
+                    'contain' => false,
+                ]);
+            } catch(Exception $e) {
+
+            }
+            if($dupe) {
+                return false;
+            }
+        }
+
 		$data = [
 			'jobtype' => $jobName,
 			'data' => serialize($data),
@@ -87,13 +154,43 @@ class QueuedTask extends QueueAppModel {
 			'reference' => $reference,
 			'priority' => $this->_next_priority
 		];
+        //save dupeKey if we have one
+        if($dupeKey) {
+            $data['dupekey'] = $dupeKey;
+        }
 		$this->_next_priority = 5; // reset to default;
 		if ($notBefore !== null) {
 			$data['notbefore'] = date('Y-m-d H:i:s', strtotime($notBefore));
 		}
 		$this->create();
-		return $this->save($data);
+		$result = $this->save($data);
+
+        //send sqs message
+        $this->triggerSqsMessage($jobName, $this->id);
+
+        return $result;
 	}
+
+	public function triggerSqsMessage($jobName, $taskId) {
+        try {
+            $queues = Configure::read('Queue.sqs_queues');
+            if(array_key_exists($jobName, $queues)) {
+                $queueUrl = $queues[$jobName];
+            } else {
+                $queueUrl = $queues['DEFAULT'];
+            }
+
+            $response = $this->sqsClient->sendMessage(array(
+                'QueueUrl'    => $queueUrl,
+                'MessageBody' => json_encode([
+                    'id' => $taskId
+                ])
+            ));
+        } catch(Exception $e) {
+
+        }
+
+    }
 
 /**
  * Set exit to true on error
@@ -103,6 +200,137 @@ class QueuedTask extends QueueAppModel {
 	public function onError() {
 		$this->exit = true;
 	}
+
+	public function requestSqsJob($queueUrl, $waitTime=20) {
+        //get record from SQS
+        $result = $this->sqsClient->receiveMessage(array(
+            'QueueUrl' => $queueUrl,
+            'WaitTimeSeconds' => $waitTime
+        ));
+
+
+        if(!$result || !$result->get('Messages')) {
+            return [];
+        }
+        $message = $result->get('Messages')[0];
+
+
+        try {
+            $data = json_decode($message['Body'], true);
+        } catch(\Exception $e) {
+
+            return [];
+        }
+
+        //read record from database
+        $dbRecord = $this->find('first', [
+            'conditions' => [
+                'id' => $data['id']
+            ],
+            'contain' => false,
+        ]);
+
+        if(!$dbRecord || $dbRecord['QueuedTask']['completed']) {
+            //doesn't exist or is completed
+            $this->deleteSqsMessage($queueUrl, $message['ReceiptHandle']);
+            return [];
+        }
+
+        //confirm we are not withing the last fetch window
+        if($dbRecord['QueuedTask']['fetched']) {
+            $maxTime = new DateTime('-1 minutes');
+            $fetchDate = new DateTime($dbRecord['QueuedTask']['fetched']);
+            if($maxTime < $fetchDate) {
+                //not timed out yet, ignore
+                $this->deleteSqsMessage($queueUrl, $message['ReceiptHandle']);
+                return [];
+            }
+        }
+
+
+        //claim record against database
+        $key = $this->key();
+        $date = date("Y-m-d H:i:s");
+
+        $db = $this->getDataSource();
+        $dateString = $db->value($date, 'string');
+        $workerKey = $db->value($key, 'string');
+
+        $this->updateAll([
+            'fetched' => $dateString,
+            'workerkey' => $workerKey,
+        ],[
+            'id' => $dbRecord['QueuedTask']['id'],
+            'fetched' => $dbRecord['QueuedTask']['fetched'],
+            'workerkey' => $dbRecord['QueuedTask']['workerkey'],
+        ]);
+
+        $confirmRecord = $this->find('first', [
+            'conditions' => [
+                'id' => $data['id']
+            ],
+            'contain' => false,
+        ]);
+
+        if(
+            !$confirmRecord ||
+            $confirmRecord['QueuedTask']['workerkey'] !== $key ||
+            $confirmRecord['QueuedTask']['fetched'] !== $date
+        ) {
+            //did not claim
+            $this->deleteSqsMessage($queueUrl, $message['ReceiptHandle']);
+            return [];
+        }
+
+        $confirmRecord['QueuedTask']['sqsReceiptHandle'] = $message['ReceiptHandle'];
+
+        return $confirmRecord['QueuedTask'];
+    }
+
+    public function markJobDoneSqs($dbRecord, $sqsQueueUrl) {
+        $fields = [
+            $this->alias . '.completed' => "'" . date('Y-m-d H:i:s') . "'"
+        ];
+        $conditions = [
+            $this->alias . '.id' => $dbRecord['id']
+        ];
+        $this->updateAll($fields, $conditions);
+
+        $this->deleteSqsMessage($sqsQueueUrl, $dbRecord['sqsReceiptHandle']);
+    }
+
+    /**
+     * Mark a job as Failed, Incrementing the failed-counter and Requeueing it.
+     *
+     * @param int $id ID of task
+     * @param string $failureMessage Optional message to append to the failure_message field.
+     * @return bool Success
+     */
+    public function markJobFailedSqs($dbRecord, $sqsQueueUrl, $failureMessage = null) {
+        $db = $this->getDataSource();
+        $fields = [
+            $this->alias . '.failed' => $this->alias . '.failed + 1',
+            $this->alias . '.failure_message' => $db->value($failureMessage),
+        ];
+        $conditions = [
+            $this->alias . '.id' => $dbRecord['id']
+        ];
+        $this->updateAll($fields, $conditions);
+
+        $this->deleteSqsMessage($sqsQueueUrl, $dbRecord['sqsReceiptHandle']);
+
+    }
+
+    public function deleteSqsMessage($queueUrl, $receiptHandle) {
+        try {
+            $this->sqsClient->deleteMessage([
+                'QueueUrl' => $queueUrl,
+                'ReceiptHandle' => $receiptHandle
+            ]);
+        } catch(\Exception $e) {
+
+        }
+    }
 
 /**
  * Look for a new job that can be processed with the current abilities and

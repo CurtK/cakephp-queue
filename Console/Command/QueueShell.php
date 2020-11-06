@@ -261,6 +261,134 @@ class QueueShell extends AppShell {
 		}
 	}
 
+    /**
+     * Run a QueueWorker loop.
+     * Runs a Queue Worker process which will try to find unassigned jobs in the queue
+     * which it may run and try to fetch and execute them.
+     *
+     * @return void
+     */
+    public function runworkersqs() {
+        //queue url is passed in thru URL
+        $queueUrl = $this->args[0];
+
+        if(!$queueUrl) {
+            $this->out('sqs queue url as first parameter is required');
+            return;
+        }
+
+
+        if ($pidFilePath = Configure::read('Queue.pidfilepath')) {
+            if (!file_exists($pidFilePath)) {
+                mkdir($pidFilePath, 0755, true);
+            }
+            if (function_exists('posix_getpid')) {
+                $pid = posix_getpid();
+            } else {
+                $pid = $this->QueuedTask->key();
+            }
+            # global file
+            $fp = fopen($pidFilePath . 'queue.pid', "w");
+            fwrite($fp, $pid);
+            fclose($fp);
+            # specific pid file
+            if (function_exists('posix_getpid')) {
+                $pid = posix_getpid();
+            } else {
+                $pid = $this->QueuedTask->key();
+            }
+            $pidFileName = 'queue_' . $pid . '.pid';
+            $fp = fopen($pidFilePath . $pidFileName, "w");
+            fwrite($fp, $pid);
+            fclose($fp);
+        }
+        // Enable Garbage Collector (PHP >= 5.3)
+        if (function_exists('gc_enable')) {
+            gc_enable();
+        }
+        if (function_exists('pcntl_signal')) {
+            pcntl_signal(SIGTERM, [&$this, "_exit"]);
+        }
+        $this->_exit = false;
+
+        $starttime = time();
+        $group = null;
+        if (!empty($this->params['group'])) {
+            $group = $this->params['group'];
+        }
+        while (!$this->_exit) {
+            // make sure accidental overriding isnt possible
+            set_time_limit(0);
+            if (!empty($pidFilePath)) {
+                touch($pidFilePath . 'queue.pid');
+            }
+            if (!empty($pidFileName)) {
+                touch($pidFilePath . $pidFileName);
+            }
+            //$this->_log('runworker', isset($pid) ? $pid : null);
+            $this->out('[' . date('Y-m-d H:i:s') . '] Looking for Job ...');
+
+            $data = $this->QueuedTask->requestSqsJob($queueUrl);
+            //$data = $this->QueuedTask->requestJob($this->_getTaskConf(), $group);
+            if ($this->QueuedTask->exit === true) {
+                $this->_exit = true;
+            } else {
+                if ($data) {
+                    $this->out('Running Job of type "' . $data['jobtype'] . '"');
+                    $taskname = 'Queue' . $data['jobtype'];
+
+                    if ($this->{$taskname}->autoUnserialize) {
+                        $data['data'] = unserialize($data['data']);
+                    }
+                    //prevent tasks that don't catch their own errors from killing this worker
+
+                    try {
+                        $return = $this->{$taskname}->run($data['data'], $data['id']);
+                    } catch ( Exception $e)
+                    {
+                        //assume job failed
+                        $return = false;
+
+                        //log the exception
+                        $this->_logError( $taskname ."\n\n". $e->getMessage() ."\n\n". $e->getTraceAsString() );
+                    }
+
+                    if ($return) {
+                        $this->QueuedTask->markJobDoneSqs($data, $queueUrl);
+                        $this->out('Job Finished.');
+                    } else {
+                        $failureMessage = null;
+                        if (isset($this->{$taskname}->failureMessage) && !empty($this->{$taskname}->failureMessage)) {
+                            $failureMessage = $this->{$taskname}->failureMessage;
+                        }
+                        $this->QueuedTask->markJobFailedSqs($data, $queueUrl, $failureMessage);
+                        $this->out('Job did not finish, requeued.');
+                    }
+                } elseif (Configure::read('Queue.exitwhennothingtodo')) {
+                    $this->out('nothing to do, exiting.');
+                    $this->_exit = true;
+                } else {
+                    $this->out('nothing to do, sleeping.');
+                    sleep(Configure::read('Queue.sleeptime'));
+                }
+
+                // check if we are over the maximum runtime and end processing if so.
+                if (Configure::read('Queue.workermaxruntime') && (time() - $starttime) >= Configure::read('Queue.workermaxruntime')) {
+                    $this->_exit = true;
+                    $this->out('Reached runtime of ' . (time() - $starttime) . ' Seconds (Max ' . Configure::read('Queue.workermaxruntime') . '), terminating.');
+                }
+                if ($this->_exit || rand(0, 100) > (100 - Configure::read('Queue.gcprob'))) {
+                    $this->out('Performing Old job cleanup.');
+                    $this->QueuedTask->cleanOldJobs();
+                }
+                $this->hr();
+            }
+        }
+        if (!empty($pidFilePath)) {
+            unlink($pidFilePath . 'queue_' . $pid . '.pid');
+        }
+    }
+
 /**
  * Manually trigger a Finished job cleanup.
  *
