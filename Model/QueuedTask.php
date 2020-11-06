@@ -182,6 +182,7 @@ class QueuedTask extends QueueAppModel {
 
             $response = $this->sqsClient->sendMessage(array(
                 'QueueUrl'    => $queueUrl,
+                'DelaySeconds' => 2,
                 'MessageBody' => json_encode([
                     'id' => $taskId,
                     'retryCount' => $retryCount,
