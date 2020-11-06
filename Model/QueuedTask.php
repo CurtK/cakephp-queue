@@ -210,6 +210,7 @@ class QueuedTask extends QueueAppModel {
 
 
         if(!$result || !$result->get('Messages')) {
+            echo "\nNo messages\n";
             return [];
         }
         $message = $result->get('Messages')[0];
@@ -218,7 +219,7 @@ class QueuedTask extends QueueAppModel {
         try {
             $data = json_decode($message['Body'], true);
         } catch(\Exception $e) {
-
+            echo "\n JSON decode failed\n";
             return [];
         }
 
@@ -231,6 +232,8 @@ class QueuedTask extends QueueAppModel {
         ]);
 
         if(!$dbRecord || $dbRecord['QueuedTask']['completed']) {
+            echo "\n DB record lookup failed\n";
+            print_r($dbRecord);
             //doesn't exist or is completed
             $this->deleteSqsMessage($queueUrl, $message['ReceiptHandle']);
             return [];
@@ -277,6 +280,8 @@ class QueuedTask extends QueueAppModel {
             $confirmRecord['QueuedTask']['workerkey'] !== $key ||
             $confirmRecord['QueuedTask']['fetched'] !== $date
         ) {
+            echo "\n claim failed\n";
+            print_r($confirmRecord);
             //did not claim
             $this->deleteSqsMessage($queueUrl, $message['ReceiptHandle']);
             return [];
