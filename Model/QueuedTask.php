@@ -171,7 +171,7 @@ class QueuedTask extends QueueAppModel {
         return $result;
 	}
 
-	public function triggerSqsMessage($jobName, $taskId) {
+	public function triggerSqsMessage($jobName, $taskId, $retryCount=0) {
         try {
             $queues = Configure::read('Queue.sqs_queues');
             if(array_key_exists($jobName, $queues)) {
@@ -183,7 +183,9 @@ class QueuedTask extends QueueAppModel {
             $response = $this->sqsClient->sendMessage(array(
                 'QueueUrl'    => $queueUrl,
                 'MessageBody' => json_encode([
-                    'id' => $taskId
+                    'id' => $taskId,
+                    'retryCount' => $retryCount,
+                    'jobtype' => $jobName
                 ])
             ));
         } catch(Exception $e) {
@@ -233,7 +235,14 @@ class QueuedTask extends QueueAppModel {
 
         if(!$dbRecord || $dbRecord['QueuedTask']['completed']) {
             echo "\n DB record lookup failed\n";
+            print_r($data);
+            echo "\ndb record\n";
             print_r($dbRecord);
+            if(!$data['retryCount'] || $data['retryCount'] < 3) {
+                echo "\nAttempting a retry\n";
+                sleep(1);
+                $this->triggerSqsMessage($data['jobtype'], $data['id'], $data['retryCount']++);
+            }
             //doesn't exist or is completed
             $this->deleteSqsMessage($queueUrl, $message['ReceiptHandle']);
             return [];
