@@ -166,12 +166,28 @@ class QueuedTask extends QueueAppModel {
 		$result = $this->save($data);
 
         //send sqs message
-        $this->triggerSqsMessage($jobName, $this->id);
+        if ($notBefore !== null) {
+            $delaySeconds = 2;
+            try {
+                $now = strtotime('now');
+                $targetDate = strtotime($notBefore);
+                $delaySeconds = abs($now - $targetDate);
+                if($delaySeconds > 900){
+                    $delaySeconds = 890;
+                }
+            } catch(Exception $e) {
+
+            }
+            $this->triggerSqsMessage($jobName, $this->id, 0, $delaySeconds);
+        } else {
+            $this->triggerSqsMessage($jobName, $this->id);
+        }
+
 
         return $result;
 	}
 
-	public function triggerSqsMessage($jobName, $taskId, $retryCount=0) {
+	public function triggerSqsMessage($jobName, $taskId, $retryCount=0, $delaySeconds=2) {
         try {
             $queues = Configure::read('Queue.sqs_queues');
             if(array_key_exists($jobName, $queues)) {
@@ -182,7 +198,7 @@ class QueuedTask extends QueueAppModel {
 
             $response = $this->sqsClient->sendMessage(array(
                 'QueueUrl'    => $queueUrl,
-                'DelaySeconds' => 2,
+                'DelaySeconds' => $delaySeconds,
                 'MessageBody' => json_encode([
                     'id' => $taskId,
                     'retryCount' => $retryCount,
@@ -234,17 +250,22 @@ class QueuedTask extends QueueAppModel {
             'contain' => false,
         ]);
 
-        if(!$dbRecord || $dbRecord['QueuedTask']['completed']) {
+        if(!$dbRecord) {
             echo "\n DB record lookup failed\n";
             print_r($data);
             echo "\ndb record\n";
             print_r($dbRecord);
             if(!$data['retryCount'] || $data['retryCount'] < 3) {
                 echo "\nAttempting a retry\n";
-                sleep(1);
-                $this->triggerSqsMessage($data['jobtype'], $data['id'], $data['retryCount']++);
+                $this->triggerSqsMessage($data['jobtype'], $data['id'], $data['retryCount']++, 10);
             }
             //doesn't exist or is completed
+            $this->deleteSqsMessage($queueUrl, $message['ReceiptHandle']);
+            return [];
+        }
+
+        if($dbRecord['QueuedTask']['completed']) {
+            //already done
             $this->deleteSqsMessage($queueUrl, $message['ReceiptHandle']);
             return [];
         }
@@ -254,6 +275,7 @@ class QueuedTask extends QueueAppModel {
             $maxTime = new DateTime('-1 minutes');
             $fetchDate = new DateTime($dbRecord['QueuedTask']['fetched']);
             if($maxTime < $fetchDate) {
+                $this->triggerSqsMessage($data['jobtype'], $data['id'], $data['retryCount'], 60);
                 //not timed out yet, ignore
                 $this->deleteSqsMessage($queueUrl, $message['ReceiptHandle']);
                 return [];
