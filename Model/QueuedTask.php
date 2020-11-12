@@ -4,6 +4,7 @@ use Aws\Sqs\SqsClient;
 App::uses('QueueAppModel', 'Queue.Model');
 App::uses('Hash', 'Utility');
 
+
 /**
  * QueuedTask for queued tasks.
  *
@@ -187,7 +188,24 @@ class QueuedTask extends QueueAppModel {
         return $result;
 	}
 
+	public function findAndRescheduleTasks() {
+        $backDate = date('Y-m-d H:i:s', strtotime('-5 minutes'));
+
+        foreach($this->find('all', [
+            'conditions' => [
+                'created < ' => $backDate,
+                'fetched IS NULL',
+                'notbefore IS NULL',
+
+            ],
+            'contain' => false
+        ]) as $queuedTask) {
+            $this->triggerSqsMessage($queuedTask['QueuedTask']['jobtype'], $queuedTask['QueuedTask']['id']);
+        }
+    }
+
 	public function triggerSqsMessage($jobName, $taskId, $retryCount=0, $delaySeconds=2) {
+        $queueUrl = false;
         try {
             $queues = Configure::read('Queue.sqs_queues');
             if(array_key_exists($jobName, $queues)) {
@@ -206,7 +224,15 @@ class QueuedTask extends QueueAppModel {
                 ])
             ));
         } catch(Exception $e) {
+            try {
+                CakeLog::write( 'QUEUE_SQS_TRIGGER', json_encode([
+                    'error' => $e->getMessage(),
+                    'queueUrl' => $queueUrl,
+                    'jobtype' => $jobName
+                ]) );
+            } catch (Exception $e) {
 
+            }
         }
 
     }
@@ -258,6 +284,11 @@ class QueuedTask extends QueueAppModel {
             if(!$data['retryCount'] || $data['retryCount'] < 3) {
                 echo "\nAttempting a retry\n";
                 $this->triggerSqsMessage($data['jobtype'], $data['id'], $data['retryCount']++, 10);
+            } else {
+                CakeLog::write( 'SQS_RETRY_OUT_' . $data['id'], json_encode([
+                    'data' => $data,
+                    'queueUrl' => $queueUrl
+                ]) );
             }
             //doesn't exist or is completed
             $this->deleteSqsMessage($queueUrl, $message['ReceiptHandle']);
@@ -314,6 +345,11 @@ class QueuedTask extends QueueAppModel {
         ) {
             echo "\n claim failed\n";
             print_r($confirmRecord);
+            CakeLog::write( 'SQS_CLAIM_FAILED_' . $data['id'], json_encode([
+                'data' => $data,
+                'queueUrl' => $queueUrl,
+                'confirmRecord' => $confirmRecord
+            ]) );
             //did not claim
             $this->deleteSqsMessage($queueUrl, $message['ReceiptHandle']);
             return [];
