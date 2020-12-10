@@ -282,8 +282,10 @@ class QueuedTask extends QueueAppModel {
             echo "\ndb record\n";
             print_r($dbRecord);
             if(!$data['retryCount'] || $data['retryCount'] < 3) {
-                echo "\nAttempting a retry\n";
-                $this->triggerSqsMessage($data['jobtype'], $data['id'], $data['retryCount']++, 10);
+                $data['retryCount']++;
+                echo "\nAttempting a retry: " . $data['retryCount'] . "\n";
+                $this->triggerSqsMessage($data['jobtype'], $data['id'], $data['retryCount'], 10);
+
             } else {
                 CakeLog::write( 'SQS_RETRY_OUT_' . $data['id'], json_encode([
                     'data' => $data,
