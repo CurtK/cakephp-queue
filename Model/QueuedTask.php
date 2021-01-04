@@ -275,22 +275,20 @@ class QueuedTask extends QueueAppModel {
             ],
             'contain' => false,
         ]);
+        if(!$data['retryCount']) {
+            $data['retryCount'] = 0;
+        }
 
         if(!$dbRecord) {
             echo "\n DB record lookup failed\n";
             print_r($data);
             echo "\ndb record\n";
             print_r($dbRecord);
-            if(!$data['retryCount'] || $data['retryCount'] < 3) {
+            if($data['retryCount'] < 1) {
                 $data['retryCount']++;
                 echo "\nAttempting a retry: " . $data['retryCount'] . "\n";
                 $this->triggerSqsMessage($data['jobtype'], $data['id'], $data['retryCount'], 10);
 
-            } else {
-                CakeLog::write( 'SQS_RETRY_OUT_' . $data['id'], json_encode([
-                    'data' => $data,
-                    'queueUrl' => $queueUrl
-                ]) );
             }
             //doesn't exist or is completed
             $this->deleteSqsMessage($queueUrl, $message['ReceiptHandle']);
